@@ -54,6 +54,7 @@ ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <stdlib.h>
 #include <media/hardware/HardwareAPI.h>
 #include <media/msm_media_info.h>
+#include <OMX_VideoExt.h>
 
 #ifndef _ANDROID_
 #include <sys/ioctl.h>
@@ -1323,6 +1324,10 @@ int omx_vdec::log_input_buffers(const char *buffer_addr, int buffer_len)
                 sprintf(m_debug.infile_name, "%s/input_dec_%d_%d_%p.264",
                         m_debug.log_loc, drv_ctx.video_resolution.frame_width, drv_ctx.video_resolution.frame_height, this);
         }
+        else if(!strncmp(drv_ctx.kind, "OMX.qcom.video.decoder.hevc", OMX_MAX_STRINGNAME_SIZE)) {
+                sprintf(m_debug.infile_name, "%s/input_dec_%d_%d_%p.265",
+                        m_debug.log_loc, drv_ctx.video_resolution.frame_width, drv_ctx.video_resolution.frame_height, this);
+        }
         else if(!strncmp(drv_ctx.kind, "OMX.qcom.video.decoder.vc1", OMX_MAX_STRINGNAME_SIZE)) {
                 sprintf(m_debug.infile_name, "%s/input_dec_%d_%d_%p.vc1",
                         m_debug.log_loc, drv_ctx.video_resolution.frame_width, drv_ctx.video_resolution.frame_height, this);
@@ -1959,18 +1964,6 @@ OMX_ERRORTYPE  omx_vdec::send_command(OMX_IN OMX_HANDLETYPE hComp,
         DEBUG_PRINT_ERROR("send_command(): ERROR OMX_CommandFlush "
                 "to invalid port: %lu", param1);
         return OMX_ErrorBadPortIndex;
-    } else if (cmd == OMX_CommandFlush && (param1 == OMX_CORE_INPUT_PORT_INDEX ||
-                param1 == OMX_ALL)) {
-        while (android_atomic_add(0, &m_queued_codec_config_count) > 0) {
-            struct timespec ts;
-
-            clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_sec += 2;
-            if (sem_timedwait(&m_safe_flush, &ts)) {
-                DEBUG_PRINT_ERROR("Failed to wait for EBDs of CODEC CONFIG buffers");
-                break;
-            }
-        }
     }
 
     post_event((unsigned)cmd,(unsigned)param1,OMX_COMPONENT_GENERATE_COMMAND);
@@ -2305,6 +2298,22 @@ OMX_ERRORTYPE  omx_vdec::send_command_proxy(OMX_IN OMX_HANDLETYPE hComp,
 #ifdef _MSM8974_
         send_codec_config();
 #endif
+        if (cmd == OMX_CommandFlush && (param1 == OMX_CORE_INPUT_PORT_INDEX ||
+                    param1 == OMX_ALL)) {
+            while (android_atomic_add(0, &m_queued_codec_config_count) > 0) {
+               struct timespec ts;
+
+               clock_gettime(CLOCK_REALTIME, &ts);
+               ts.tv_sec += 2;
+               DEBUG_PRINT_LOW("waiting for %d EBDs of CODEC CONFIG buffers ",
+                       m_queued_codec_config_count);
+               if (sem_timedwait(&m_safe_flush, &ts)) {
+                   DEBUG_PRINT_ERROR("Failed to wait for EBDs of CODEC CONFIG buffers");
+                   break;
+               }
+            }
+        }
+
         if (OMX_CORE_INPUT_PORT_INDEX == param1 || OMX_ALL == param1) {
             BITMASK_SET(&m_flags, OMX_COMPONENT_INPUT_FLUSH_PENDING);
         }
@@ -2695,9 +2704,13 @@ OMX_ERRORTYPE omx_vdec::get_supported_profile_level_for_1080p(OMX_VIDEO_PARAM_PR
                 eRet = OMX_ErrorNoMore;
             }
         } else if (!strncmp(drv_ctx.kind, "OMX.qcom.video.decoder.hevc", OMX_MAX_STRINGNAME_SIZE)) {
-                DEBUG_PRINT_LOW("get_parameter: OMX_IndexParamVideoProfileLevelQuerySupported nProfileIndex ret NoMore %d",
-                        profileLevelType->nProfileIndex);
+            if (profileLevelType->nProfileIndex == 0) {
+                profileLevelType->eProfile = OMX_VIDEO_HEVCProfileMain;
+                profileLevelType->eLevel   = OMX_VIDEO_HEVCMainTierLevel51;
+            } else {
+                DEBUG_PRINT_LOW("get_parameter: OMX_IndexParamVideoProfileLevelQuerySupported nProfileIndex ret NoMore %lu", profileLevelType->nProfileIndex);
                 eRet = OMX_ErrorNoMore;
+            }
         } else if ((!strncmp(drv_ctx.kind, "OMX.qcom.video.decoder.h263",OMX_MAX_STRINGNAME_SIZE))) {
             if (profileLevelType->nProfileIndex == 0) {
                 profileLevelType->eProfile = OMX_VIDEO_H263ProfileBaseline;
@@ -2811,21 +2824,24 @@ OMX_ERRORTYPE  omx_vdec::get_parameter(OMX_IN OMX_HANDLETYPE     hComp,
                                 } else if (1 == portFmt->nPortIndex) {
                                     portFmt->eCompressionFormat =  OMX_VIDEO_CodingUnused;
 
-                                    if (0 == portFmt->nIndex)
-                                        portFmt->eColorFormat = (OMX_COLOR_FORMATTYPE)
-                                            QOMX_COLOR_FORMATYUV420PackedSemiPlanar32m;
-                                    else if (1 == portFmt->nIndex)
-                                        portFmt->eColorFormat = OMX_COLOR_FormatYUV420Planar;
-                                    else if (2 == portFmt->nIndex &&
-                                        drv_ctx.decoder_format == VDEC_CODECTYPE_MVC)
-                                        portFmt->eColorFormat = (OMX_COLOR_FORMATTYPE)
-                                            QOMX_COLOR_FORMATYUV420PackedSemiPlanar32mMultiView;
-                                    else {
+                                    // Distinguish non-surface mode from normal playback use-case based on
+                                    // usage hinted via "OMX.google.android.index.useAndroidNativeBuffer2"
+                                    // For non-android, use the default list
+                                    bool useNonSurfaceMode = false;
+#if _ANDROID_
+                                    useNonSurfaceMode = (m_enable_android_native_buffers == OMX_FALSE);
+#endif
+                                    portFmt->eColorFormat = useNonSurfaceMode ?
+                                        getPreferredColorFormatNonSurfaceMode(portFmt->nIndex) :
+                                        getPreferredColorFormatDefaultMode(portFmt->nIndex);
+
+                                    if (portFmt->eColorFormat == OMX_COLOR_FormatMax ) {
+                                        eRet = OMX_ErrorNoMore;
                                         DEBUG_PRINT_LOW("get_parameter: OMX_IndexParamVideoPortFormat:"\
                                                 " NoMore Color formats");
-                                        eRet =  OMX_ErrorNoMore;
                                     }
-                                    DEBUG_PRINT_LOW("returning 0x%x", portFmt->eColorFormat);
+                                    DEBUG_PRINT_HIGH("returning color-format: 0x%x", portFmt->eColorFormat);
+                                    ALOGI("returning color-format: 0x%x", portFmt->eColorFormat);
                                 } else {
                                     DEBUG_PRINT_ERROR("get_parameter: Bad port index %d",
                                             (int)portFmt->nPortIndex);
@@ -3256,12 +3272,9 @@ OMX_ERRORTYPE  omx_vdec::set_parameter(OMX_IN OMX_HANDLETYPE     hComp,
                                                 QOMX_COLOR_FORMATYUV420PackedSemiPlanar32m ||
                                             portFmt->eColorFormat == (OMX_COLOR_FORMATTYPE)
                                                 QOMX_COLOR_FORMATYUV420PackedSemiPlanar32mMultiView ||
-                                            portFmt->eColorFormat == OMX_COLOR_FormatYUV420Planar)
+                                            portFmt->eColorFormat == OMX_COLOR_FormatYUV420Planar ||
+                                            portFmt->eColorFormat == OMX_COLOR_FormatYUV420SemiPlanar)
                                         op_format = (enum vdec_output_fromat)VDEC_YUV_FORMAT_NV12;
-                                    else if (portFmt->eColorFormat ==
-                                            (OMX_COLOR_FORMATTYPE)
-                                            QOMX_COLOR_FormatYUV420PackedSemiPlanar64x32Tile2m8ka)
-                                        op_format = VDEC_YUV_FORMAT_TILE_4x2;
                                     else
                                         eRet = OMX_ErrorBadParameter;
 
@@ -3614,6 +3627,11 @@ OMX_ERRORTYPE  omx_vdec::set_parameter(OMX_IN OMX_HANDLETYPE     hComp,
                                            EnableAndroidNativeBuffersParams* enableNativeBuffers = (EnableAndroidNativeBuffersParams *) paramData;
                                            if (enableNativeBuffers) {
                                                m_enable_android_native_buffers = enableNativeBuffers->enable;
+                                               // Use the most-preferred-native-color-format as surface-mode is hinted here
+                                               if(!client_buffers.set_color_format(getPreferredColorFormatDefaultMode(0))) {
+                                                   DEBUG_PRINT_ERROR("Failed to set native color format!");
+                                                   eRet = OMX_ErrorUnsupportedSetting;
+                                               }
                                            }
                                        }
                                        break;
@@ -5905,14 +5923,15 @@ if (buffer->nFlags & QOMX_VIDEO_BUFFERFLAG_EOSEQ) {
     buf.flags |= (buffer->nFlags & OMX_BUFFERFLAG_CODECCONFIG) ? V4L2_QCOM_BUF_FLAG_CODECCONFIG: 0;
     buf.flags |= (buffer->nFlags & OMX_BUFFERFLAG_DECODEONLY) ? V4L2_QCOM_BUF_FLAG_DECODEONLY: 0;
 
+    if (buffer->nFlags & OMX_BUFFERFLAG_CODECCONFIG) {
+        DEBUG_PRINT_LOW("Increment codec_config buffer counter");
+        android_atomic_inc(&m_queued_codec_config_count);
+    }
+
     rc = ioctl(drv_ctx.video_driver_fd, VIDIOC_QBUF, &buf);
     if (rc) {
         DEBUG_PRINT_ERROR("Failed to qbuf Input buffer to driver");
         return OMX_ErrorHardware;
-    }
-
-    if (buffer->nFlags & OMX_BUFFERFLAG_CODECCONFIG) {
-        android_atomic_inc(&m_queued_codec_config_count);
     }
 
     if (codec_config_flag && !(buffer->nFlags & OMX_BUFFERFLAG_CODECCONFIG)) {
@@ -6923,18 +6942,6 @@ OMX_ERRORTYPE omx_vdec::empty_buffer_done(OMX_HANDLETYPE         hComp,
     DEBUG_PRINT_LOW("empty_buffer_done: bufhdr = %p, bufhdr->pBuffer = %p, bufhdr->nFlags = %x",
             buffer, buffer->pBuffer, buffer->nFlags);
     pending_input_buffers--;
-    if (buffer->nFlags & OMX_BUFFERFLAG_CODECCONFIG) {
-        int pending_flush_waiters;
-
-        while (pending_flush_waiters = INT_MAX,
-                sem_getvalue(&m_safe_flush, &pending_flush_waiters),
-                /* 0 == there /are/ waiters depending on POSIX implementation */
-                pending_flush_waiters <= 0 ) {
-            sem_post(&m_safe_flush);
-        }
-
-        android_atomic_and(0, &m_queued_codec_config_count); /* no clearer way to set to 0 */
-    }
 
     if (arbitrary_bytes) {
         if (pdest_frame == NULL && input_flush_progress == false) {
@@ -7033,6 +7040,22 @@ int omx_vdec::async_message_process (void *context, void* message)
                 omxhdr->nFlags |= OMX_BUFFERFLAG_DATACORRUPT;
                 vdec_msg->status_code = VDEC_S_INPUT_BITSTREAM_ERR;
             }
+
+            if (omxhdr->nFlags & OMX_BUFFERFLAG_CODECCONFIG) {
+                int pending_flush_waiters;
+
+                while (pending_flush_waiters = INT_MAX,
+                    sem_getvalue(&omx->m_safe_flush, &pending_flush_waiters),
+                    /* 0 == there /are/ waiters depending on POSIX implementation */
+                    pending_flush_waiters <= 0 ) {
+                    DEBUG_PRINT_LOW("sem post for %d EBD of CODEC CONFIG buffer",
+                        omx->m_queued_codec_config_count);
+                    sem_post(&omx->m_safe_flush);
+                }
+                DEBUG_PRINT_LOW("Reset codec_config buffer counter");
+                android_atomic_and(0, &omx->m_queued_codec_config_count); /* no clearer way to set to 0 */
+            }
+
             omx->post_event ((unsigned int)omxhdr,vdec_msg->status_code,
                     OMX_COMPONENT_GENERATE_EBD);
             break;
@@ -8353,7 +8376,8 @@ OMX_ERRORTYPE omx_vdec::update_portdef(OMX_PARAM_PORTDEFINITIONTYPE *portDefn)
     portDefn->format.video.nFrameWidth  =  drv_ctx.video_resolution.frame_width;
     portDefn->format.video.nStride = drv_ctx.video_resolution.stride;
     portDefn->format.video.nSliceHeight = drv_ctx.video_resolution.scan_lines;
-    if (portDefn->format.video.eColorFormat == OMX_COLOR_FormatYUV420Planar) {
+    if ((portDefn->format.video.eColorFormat == OMX_COLOR_FormatYUV420Planar) ||
+       (portDefn->format.video.eColorFormat == OMX_COLOR_FormatYUV420SemiPlanar)) {
         portDefn->format.video.nStride = drv_ctx.video_resolution.frame_width;
         portDefn->format.video.nSliceHeight = drv_ctx.video_resolution.frame_height;
     }
@@ -9532,6 +9556,7 @@ omx_vdec::allocate_color_convert_buf::allocate_color_convert_buf()
     omx = NULL;
     init_members();
     ColorFormat = OMX_COLOR_FormatMax;
+    dest_format = YCbCr420P;
 }
 
 void omx_vdec::allocate_color_convert_buf::set_vdec_client(void *client)
@@ -9583,7 +9608,7 @@ bool omx_vdec::allocate_color_convert_buf::update_buffer_req()
     c2d.close();
     status = c2d.open(omx->drv_ctx.video_resolution.frame_height,
             omx->drv_ctx.video_resolution.frame_width,
-            NV12_128m,YCbCr420P);
+            NV12_128m,dest_format);
     if (status) {
         status = c2d.get_buffer_size(C2D_INPUT,src_size);
         if (status)
@@ -9636,11 +9661,14 @@ bool omx_vdec::allocate_color_convert_buf::set_color_format(
         drv_color_format != dest_color_format &&
         drv_color_format != QOMX_COLOR_FORMATYUV420PackedSemiPlanar32mMultiView) {
         DEBUG_PRINT_LOW("Enabling C2D");
-        if (dest_color_format != OMX_COLOR_FormatYUV420Planar) {
+        if ((dest_color_format != OMX_COLOR_FormatYUV420Planar) &&
+           (dest_color_format != OMX_COLOR_FormatYUV420SemiPlanar)) {
             DEBUG_PRINT_ERROR("Unsupported color format for c2d");
             status = false;
         } else {
-            ColorFormat = OMX_COLOR_FormatYUV420Planar;
+            ColorFormat = dest_color_format;
+            dest_format = (dest_color_format == OMX_COLOR_FormatYUV420Planar) ?
+                    YCbCr420P : YCbCr420SP;
             if (enabled)
                 c2d.destroy();
             enabled = false;
@@ -9691,13 +9719,17 @@ OMX_BUFFERHEADERTYPE* omx_vdec::allocate_color_convert_buf::get_il_buf_hdr()
             status = c2d.convert(omx->drv_ctx.ptr_outputbuffer[index].pmem_fd,
                     omx->m_out_mem_ptr->pBuffer, bufadd->pBuffer, pmem_fd[index],
                     pmem_baseaddress[index], pmem_baseaddress[index]);
-            pthread_mutex_unlock(&omx->c_lock);
-            m_out_mem_ptr_client[index].nFilledLen = buffer_size_req;
             if (!status) {
                 DEBUG_PRINT_ERROR("Failed color conversion %d", status);
                 m_out_mem_ptr_client[index].nFilledLen = 0;
+                pthread_mutex_unlock(&omx->c_lock);
                 return &m_out_mem_ptr_client[index];
+            } else {
+                unsigned int filledLen = 0;
+                c2d.get_output_filled_length(filledLen);
+                m_out_mem_ptr_client[index].nFilledLen = filledLen;
             }
+            pthread_mutex_unlock(&omx->c_lock);
         } else
             m_out_mem_ptr_client[index].nFilledLen = 0;
         return &m_out_mem_ptr_client[index];
@@ -9886,10 +9918,11 @@ bool omx_vdec::allocate_color_convert_buf::get_color_format(OMX_COLOR_FORMATTYPE
         else
             status = false;
     } else {
-        if (ColorFormat != OMX_COLOR_FormatYUV420Planar) {
-            status = false;
+        if (ColorFormat == OMX_COLOR_FormatYUV420Planar ||
+            ColorFormat == OMX_COLOR_FormatYUV420SemiPlanar) {
+            dest_color_format = ColorFormat;
         } else
-            dest_color_format = OMX_COLOR_FormatYUV420Planar;
+            status = false;
     }
     return status;
 }
